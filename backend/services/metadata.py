@@ -380,6 +380,40 @@ def _extract_title_keywords(title: str) -> list[str]:
     return result[:6]
 
 
+def _is_youtube(url: str) -> bool:
+    domain = urlparse(url).netloc.replace("www.", "")
+    return domain in ("youtube.com", "youtu.be")
+
+
+async def _fetch_youtube_metadata(url: str) -> dict | None:
+    """Use YouTube oEmbed API — works from any server, no auth needed."""
+    try:
+        oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(oembed_url)
+            r.raise_for_status()
+            data = r.json()
+        video_id = None
+        parsed = urlparse(url)
+        if "youtube.com" in parsed.netloc:
+            qs = dict(p.split("=", 1) for p in parsed.query.split("&") if "=" in p)
+            video_id = qs.get("v")
+        elif "youtu.be" in parsed.netloc:
+            video_id = parsed.path.lstrip("/")
+        thumbnail = (
+            f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+            if video_id else data.get("thumbnail_url")
+        )
+        return {
+            "title":       data.get("title", url),
+            "description": f"By {data.get('author_name', 'YouTube')}",
+            "favicon":     "https://www.youtube.com/favicon.ico",
+            "thumbnail":   thumbnail,
+        }
+    except Exception:
+        return None
+
+
 async def fetch_url_metadata(url: str) -> dict:
     """Fetch title, description, favicon, thumbnail + smart auto-tags."""
     result = {
@@ -392,63 +426,70 @@ async def fetch_url_metadata(url: str) -> dict:
     }
 
     soup = None
-    try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+
+    # YouTube: use oEmbed instead of scraping (works from cloud servers)
+    if _is_youtube(url):
+        yt = await _fetch_youtube_metadata(url)
+        if yt:
+            result.update(yt)
+    else:
+        try:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            }
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                html = response.text
+
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Title
+            og_title   = soup.find("meta", property="og:title")
+            title_tag  = soup.find("title")
+            if og_title and og_title.get("content"):
+                result["title"] = og_title["content"].strip()
+            elif title_tag:
+                result["title"] = title_tag.get_text(strip=True)
+
+            # Description
+            og_desc    = soup.find("meta", property="og:description")
+            meta_desc  = soup.find("meta", attrs={"name": "description"})
+            if og_desc and og_desc.get("content"):
+                result["description"] = og_desc["content"].strip()
+            elif meta_desc and meta_desc.get("content"):
+                result["description"] = meta_desc["content"].strip()
+
+            # Thumbnail
+            og_image = soup.find("meta", property="og:image")
+            if og_image and og_image.get("content"):
+                result["thumbnail"] = og_image["content"]
+
+            # Favicon
+            parsed = urlparse(url)
+            base   = f"{parsed.scheme}://{parsed.netloc}"
+            icon_link = (
+                soup.find("link", rel="icon")
+                or soup.find("link", rel="shortcut icon")
+                or soup.find("link", rel=lambda v: v and "icon" in v)
             )
-        }
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            html = response.text
-
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Title
-        og_title   = soup.find("meta", property="og:title")
-        title_tag  = soup.find("title")
-        if og_title and og_title.get("content"):
-            result["title"] = og_title["content"].strip()
-        elif title_tag:
-            result["title"] = title_tag.get_text(strip=True)
-
-        # Description
-        og_desc    = soup.find("meta", property="og:description")
-        meta_desc  = soup.find("meta", attrs={"name": "description"})
-        if og_desc and og_desc.get("content"):
-            result["description"] = og_desc["content"].strip()
-        elif meta_desc and meta_desc.get("content"):
-            result["description"] = meta_desc["content"].strip()
-
-        # Thumbnail
-        og_image = soup.find("meta", property="og:image")
-        if og_image and og_image.get("content"):
-            result["thumbnail"] = og_image["content"]
-
-        # Favicon
-        parsed = urlparse(url)
-        base   = f"{parsed.scheme}://{parsed.netloc}"
-        icon_link = (
-            soup.find("link", rel="icon")
-            or soup.find("link", rel="shortcut icon")
-            or soup.find("link", rel=lambda v: v and "icon" in v)
-        )
-        if icon_link and icon_link.get("href"):
-            href = icon_link["href"]
-            if href.startswith("http"):
-                result["favicon"] = href
-            elif href.startswith("//"):
-                result["favicon"] = f"{parsed.scheme}:{href}"
+            if icon_link and icon_link.get("href"):
+                href = icon_link["href"]
+                if href.startswith("http"):
+                    result["favicon"] = href
+                elif href.startswith("//"):
+                    result["favicon"] = f"{parsed.scheme}:{href}"
+                else:
+                    result["favicon"] = base + ("/" if not href.startswith("/") else "") + href
             else:
-                result["favicon"] = base + ("/" if not href.startswith("/") else "") + href
-        else:
-            result["favicon"] = f"{base}/favicon.ico"
+                result["favicon"] = f"{base}/favicon.ico"
 
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     # ── Auto-tagging ──────────────────────────────────────────────────────────
     all_tags: list[str] = []
